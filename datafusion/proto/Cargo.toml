@@ -40,7 +40,7 @@ default = []
 json = ["pbjson", "pbjson-build", "serde", "serde_json"]
 
 [dependencies]
-arrow = "25.0.0"
+arrow = { git = "https://github.com/splitgraph/arrow-rs", branch = "cast-date64-to-timestamp" }
 async-trait = "0.1.41"
 datafusion = { path = "../core", version = "13.0.0" }
 datafusion-common = { path = "../common", version = "13.0.0" }
