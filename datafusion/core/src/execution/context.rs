@@ -1655,11 +1655,11 @@ impl SessionState {
         Ok(statement)
     }
 
-    /// Convert an ast Statement into a LogicalPlan
-    pub async fn statement_to_plan(
+    /// Construct a ContextProvider instance that can be used to instantiate a SqlToRel instance
+    pub async fn statement_to_context_provider(
         &self,
         statement: datafusion_sql::parser::Statement,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<SessionContextProvider> {
         use crate::catalog::information_schema::INFORMATION_SCHEMA_TABLES;
         use datafusion_sql::parser::Statement as DFStatement;
         use sqlparser::ast::*;
@@ -1737,8 +1737,19 @@ impl SessionState {
             }
         }
 
-        let query = SqlToRel::new(&provider);
-        query.statement_to_plan(statement)
+        Ok(provider)
+    }
+
+    /// Convert an ast Statement into a LogicalPlan
+    pub async fn statement_to_plan(
+        &self,
+        statement: datafusion_sql::parser::Statement,
+    ) -> Result<LogicalPlan> {
+        let provider = self
+            .statement_to_context_provider(statement.clone())
+            .await?;
+        let planner = SqlToRel::new(&provider);
+        planner.statement_to_plan(statement)
     }
 
     /// Creates a [`LogicalPlan`] from the provided SQL string
@@ -1831,9 +1842,13 @@ impl SessionState {
     }
 }
 
-struct SessionContextProvider<'a> {
-    state: &'a SessionState,
-    tables: HashMap<String, Arc<dyn TableSource>>,
+/// A helper struct implementing `ContextProvider`, for instantiating the SqlToRel logical planner
+#[derive(Clone)]
+pub struct SessionContextProvider<'a> {
+    /// The session state for which the planning is taking place
+    pub state: &'a SessionState,
+    /// A list of table metadata to be used during the planning process
+    pub tables: HashMap<String, Arc<dyn TableSource>>,
 }
 
 impl<'a> ContextProvider for SessionContextProvider<'a> {
