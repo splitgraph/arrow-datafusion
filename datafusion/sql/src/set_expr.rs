@@ -17,10 +17,12 @@
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::{
-    DataFusionError, Diagnostic, Result, Span, not_impl_err, plan_err,
+    DFSchemaRef, DataFusionError, Diagnostic, Result, Span, not_impl_err, plan_err,
 };
 use datafusion_expr::{LogicalPlan, LogicalPlanBuilder};
-use sqlparser::ast::{SetExpr, SetOperator, SetQuantifier, Spanned};
+use sqlparser::ast::{
+    Expr as SQLExpr, Ident, SelectItem, SetExpr, SetOperator, SetQuantifier, Spanned,
+};
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
@@ -42,7 +44,28 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let left_span = Span::try_from_sqlparser_span(left.span());
                 let right_span = Span::try_from_sqlparser_span(right.span());
                 let left_plan = self.set_expr_to_plan(*left, planner_context);
-                let right_plan = self.set_expr_to_plan(*right, planner_context);
+
+                // For non-*ByName operations, add missing aliases to right side using left schema's
+                // column names. This allows queries like
+                // `SELECT 1 c1, 0 c2, 0 c3 UNION ALL SELECT 2, 0, 0`
+                // where the right side has duplicate literal values.
+                // We only do this if the left side succeeded.
+                let right = if let Ok(plan) = &left_plan
+                    && plan.schema().fields().len() > 1
+                    && matches!(
+                        set_quantifier,
+                        SetQuantifier::All
+                            | SetQuantifier::Distinct
+                            | SetQuantifier::None
+                    ) {
+                    alias_set_expr(*right, plan.schema())
+                } else {
+                    *right
+                };
+
+                let right_plan = self.set_expr_to_plan(right, planner_context);
+
+                // Handle errors from both sides, collecting them if both failed
                 let (left_plan, right_plan) = match (left_plan, right_plan) {
                     (Ok(left_plan), Ok(right_plan)) => (left_plan, right_plan),
                     (Err(left_err), Err(right_err)) => {
@@ -159,4 +182,76 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
         }
     }
+}
+
+// Adds aliases to SELECT items in a SetExpr using the provided schema.
+// This ensures that unnamed expressions on the right side of a UNION/INTERSECT/EXCEPT
+// get aliased with the column names from the left side, allowing queries like
+// `SELECT 1 AS a, 0 AS b, 0 AS c UNION ALL SELECT 2, 0, 0` to work correctly.
+fn alias_set_expr(set_expr: SetExpr, schema: &DFSchemaRef) -> SetExpr {
+    match set_expr {
+        SetExpr::Select(mut select) => {
+            alias_select_items(&mut select.projection, schema);
+            SetExpr::Select(select)
+        }
+        SetExpr::SetOperation {
+            op,
+            left,
+            right,
+            set_quantifier,
+        } => {
+            // For nested set operations, only alias the leftmost branch
+            // since that's what determines the output column names
+            SetExpr::SetOperation {
+                op,
+                left: Box::new(alias_set_expr(*left, schema)),
+                right,
+                set_quantifier,
+            }
+        }
+        SetExpr::Query(mut query) => {
+            // Handle parenthesized queries like (SELECT ... UNION ALL SELECT ...)
+            query.body = Box::new(alias_set_expr(*query.body, schema));
+            SetExpr::Query(query)
+        }
+        // For other cases (Values, etc.), return as-is
+        other => other,
+    }
+}
+
+// Adds aliases to literal value expressions where missing, based on the input schema, as these are
+// the ones that can cause duplicate name issues (e.g. `SELECT 0, 0` has two columns named `Int64(0)`).
+// Other expressions typically have unique names.
+fn alias_select_items(items: &mut [SelectItem], schema: &DFSchemaRef) {
+    let mut col_idx = 0;
+    for item in items.iter_mut() {
+        match item {
+            SelectItem::UnnamedExpr(expr) if is_literal_value(expr) => {
+                if let Some(field) = schema.fields().get(col_idx) {
+                    *item = SelectItem::ExprWithAlias {
+                        expr: expr.clone(),
+                        alias: Ident::new(field.name()),
+                    };
+                }
+                col_idx += 1;
+            }
+            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {
+                col_idx += 1;
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                // Wildcards expand to multiple columns - skip position tracking
+            }
+        }
+    }
+}
+
+/// Returns true if the expression is a literal value that could cause duplicate names.
+fn is_literal_value(expr: &SQLExpr) -> bool {
+    matches!(
+        expr,
+        SQLExpr::Value(_)
+            | SQLExpr::UnaryOp { .. }
+            | SQLExpr::TypedString { .. }
+            | SQLExpr::Interval(_)
+    )
 }
