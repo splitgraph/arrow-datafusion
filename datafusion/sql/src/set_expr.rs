@@ -38,7 +38,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             SetExpr::SetOperation {
                 op,
                 left,
-                right,
+                mut right,
                 set_quantifier,
             } => {
                 let left_span = Span::try_from_sqlparser_span(left.span());
@@ -47,23 +47,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
                 // For non-*ByName operations, add missing aliases to right side using left schema's
                 // column names. This allows queries like
-                // `SELECT 1 c1, 0 c2, 0 c3 UNION ALL SELECT 2, 0, 0`
+                // `SELECT 1 a, 1 b UNION ALL SELECT 2, 2`
                 // where the right side has duplicate literal values.
                 // We only do this if the left side succeeded.
-                let right = if let Ok(plan) = &left_plan
+                if let Ok(plan) = &left_plan
                     && plan.schema().fields().len() > 1
                     && matches!(
                         set_quantifier,
                         SetQuantifier::All
                             | SetQuantifier::Distinct
                             | SetQuantifier::None
-                    ) {
-                    alias_set_expr(*right, plan.schema())
-                } else {
-                    *right
-                };
+                    )
+                {
+                    alias_set_expr(&mut right, plan.schema())
+                }
 
-                let right_plan = self.set_expr_to_plan(right, planner_context);
+                let right_plan = self.set_expr_to_plan(*right, planner_context);
 
                 // Handle errors from both sides, collecting them if both failed
                 let (left_plan, right_plan) = match (left_plan, right_plan) {
@@ -188,34 +187,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 // This ensures that unnamed expressions on the right side of a UNION/INTERSECT/EXCEPT
 // get aliased with the column names from the left side, allowing queries like
 // `SELECT 1 AS a, 0 AS b, 0 AS c UNION ALL SELECT 2, 0, 0` to work correctly.
-fn alias_set_expr(set_expr: SetExpr, schema: &DFSchemaRef) -> SetExpr {
+fn alias_set_expr(set_expr: &mut SetExpr, schema: &DFSchemaRef) {
     match set_expr {
-        SetExpr::Select(mut select) => {
-            alias_select_items(&mut select.projection, schema);
-            SetExpr::Select(select)
-        }
-        SetExpr::SetOperation {
-            op,
-            left,
-            right,
-            set_quantifier,
-        } => {
-            // For nested set operations, only alias the leftmost branch
-            // since that's what determines the output column names
-            SetExpr::SetOperation {
-                op,
-                left: Box::new(alias_set_expr(*left, schema)),
-                right,
-                set_quantifier,
-            }
-        }
-        SetExpr::Query(mut query) => {
-            // Handle parenthesized queries like (SELECT ... UNION ALL SELECT ...)
-            query.body = Box::new(alias_set_expr(*query.body, schema));
-            SetExpr::Query(query)
-        }
+        SetExpr::Select(select) => alias_select_items(&mut select.projection, schema),
+        // For nested set operations, only alias the leftmost branch
+        SetExpr::SetOperation { left, .. } => alias_set_expr(left, schema),
+        // Handle parenthesized queries like (SELECT ... UNION ALL SELECT ...)
+        SetExpr::Query(query) => alias_set_expr(&mut query.body, schema),
         // For other cases (Values, etc.), return as-is
-        other => other,
+        _other => (),
     }
 }
 
