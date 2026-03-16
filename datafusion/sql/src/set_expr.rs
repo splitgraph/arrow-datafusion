@@ -199,15 +199,19 @@ fn alias_set_expr(set_expr: &mut SetExpr, schema: &DFSchemaRef) {
     }
 }
 
-// Adds aliases to literal value expressions where missing, based on the input schema, as these are
-// the ones that can cause duplicate name issues (e.g. `SELECT 0, 0` has two columns named `Int64(0)`).
-// Other expressions typically have unique names.
+// Aliases unnamed expressions in the provided select items using the provided schema.
+// This helps with set expression queries where the right side has duplicate expressions,
+// but the left side has unique column names, which control the output schema anyway.
 fn alias_select_items(items: &mut [SelectItem], schema: &DFSchemaRef) {
     let mut col_idx = 0;
     for item in items.iter_mut() {
         match item {
-            SelectItem::UnnamedExpr(expr) if is_literal_value(expr) => {
-                if let Some(field) = schema.fields().get(col_idx) {
+            SelectItem::UnnamedExpr(expr) => {
+                if !matches!(
+                    expr,
+                    SQLExpr::Identifier(_) | SQLExpr::CompoundIdentifier(_)
+                ) && let Some(field) = schema.fields().get(col_idx)
+                {
                     *item = SelectItem::ExprWithAlias {
                         expr: expr.clone(),
                         alias: Ident::new(field.name()),
@@ -215,7 +219,7 @@ fn alias_select_items(items: &mut [SelectItem], schema: &DFSchemaRef) {
                 }
                 col_idx += 1;
             }
-            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {
+            SelectItem::ExprWithAlias { .. } => {
                 col_idx += 1;
             }
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
@@ -223,15 +227,4 @@ fn alias_select_items(items: &mut [SelectItem], schema: &DFSchemaRef) {
             }
         }
     }
-}
-
-/// Returns true if the expression is a literal value that could cause duplicate names.
-fn is_literal_value(expr: &SQLExpr) -> bool {
-    matches!(
-        expr,
-        SQLExpr::Value(_)
-            | SQLExpr::UnaryOp { .. }
-            | SQLExpr::TypedString { .. }
-            | SQLExpr::Interval(_)
-    )
 }

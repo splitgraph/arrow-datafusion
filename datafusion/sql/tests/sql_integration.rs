@@ -2656,55 +2656,82 @@ fn union_all_by_name_same_column_names() {
 }
 
 #[test]
-fn union_all_with_duplicate_literals() {
-    let sql = "SELECT 0 a, 0 b UNION ALL SELECT 1, 1";
+fn union_all_with_duplicate_expressions() {
+    let sql = "\
+        SELECT 0 a, 0 b \
+        UNION ALL SELECT 1, 1 \
+        UNION ALL SELECT count(*), count(*) FROM orders";
     let plan = logical_plan(sql).unwrap();
     assert_snapshot!(
         plan,
         @r"
     Union
-      Projection: Int64(0) AS a, Int64(0) AS b
-        EmptyRelation: rows=1
-      Projection: Int64(1) AS a, Int64(1) AS b
-        EmptyRelation: rows=1
+      Union
+        Projection: Int64(0) AS a, Int64(0) AS b
+          EmptyRelation: rows=1
+        Projection: Int64(1) AS a, Int64(1) AS b
+          EmptyRelation: rows=1
+      Projection: count(*) AS a, count(*) AS b
+        Aggregate: groupBy=[[]], aggr=[[count(*)]]
+          TableScan: orders
     "
     );
 }
 
 #[test]
-fn intersect_with_duplicate_literals() {
-    let sql = "SELECT 1 as a, 0 as b, 0 as c INTERSECT SELECT 1, 0, 0";
+fn intersect_with_duplicate_expressions() {
+    let sql = "\
+        SELECT 0 a, 0 b \
+        INTERSECT SELECT 1, 1 \
+        INTERSECT SELECT count(*), count(*) FROM orders";
     let plan = logical_plan(sql).unwrap();
     assert_snapshot!(
         plan,
         @r"
-    LeftSemi Join: left.a = right.a, left.b = right.b, left.c = right.c
+    LeftSemi Join: left.a = right.a, left.b = right.b
       Distinct:
         SubqueryAlias: left
-          Projection: Int64(1) AS a, Int64(0) AS b, Int64(0) AS c
-            EmptyRelation: rows=1
+          LeftSemi Join: left.a = right.a, left.b = right.b
+            Distinct:
+              SubqueryAlias: left
+                Projection: Int64(0) AS a, Int64(0) AS b
+                  EmptyRelation: rows=1
+            SubqueryAlias: right
+              Projection: Int64(1) AS a, Int64(1) AS b
+                EmptyRelation: rows=1
       SubqueryAlias: right
-        Projection: Int64(1) AS a, Int64(0) AS b, Int64(0) AS c
-          EmptyRelation: rows=1
+        Projection: count(*) AS a, count(*) AS b
+          Aggregate: groupBy=[[]], aggr=[[count(*)]]
+            TableScan: orders
     "
     );
 }
 
 #[test]
-fn except_with_duplicate_literals() {
-    let sql = "SELECT 1 as a, 0 as b, 0 as c EXCEPT SELECT 2, 0, 0";
+fn except_with_duplicate_expressions() {
+    let sql = "\
+        SELECT 0 a, 0 b \
+        EXCEPT SELECT 1, 1 \
+        EXCEPT SELECT count(*), count(*) FROM orders";
     let plan = logical_plan(sql).unwrap();
     assert_snapshot!(
         plan,
         @r"
-    LeftAnti Join: left.a = right.a, left.b = right.b, left.c = right.c
+    LeftAnti Join: left.a = right.a, left.b = right.b
       Distinct:
         SubqueryAlias: left
-          Projection: Int64(1) AS a, Int64(0) AS b, Int64(0) AS c
-            EmptyRelation: rows=1
+          LeftAnti Join: left.a = right.a, left.b = right.b
+            Distinct:
+              SubqueryAlias: left
+                Projection: Int64(0) AS a, Int64(0) AS b
+                  EmptyRelation: rows=1
+            SubqueryAlias: right
+              Projection: Int64(1) AS a, Int64(1) AS b
+                EmptyRelation: rows=1
       SubqueryAlias: right
-        Projection: Int64(2) AS a, Int64(0) AS b, Int64(0) AS c
-          EmptyRelation: rows=1
+        Projection: count(*) AS a, count(*) AS b
+          Aggregate: groupBy=[[]], aggr=[[count(*)]]
+            TableScan: orders
     "
     );
 }
