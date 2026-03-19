@@ -203,6 +203,21 @@ fn alias_set_expr(set_expr: &mut SetExpr, schema: &DFSchemaRef) {
 // This helps with set expression queries where the right side has duplicate expressions,
 // but the left side has unique column names, which control the output schema anyway.
 fn alias_select_items(items: &mut [SelectItem], schema: &DFSchemaRef) {
+    // Figure out how many (qualified) wildcards we got. We only handle
+    // the case of a single unqualified wildcard; for multiple or qualified
+    // wildcards we can't reliably determine column counts, so bail out.
+    let (wildcard_count, qualified_wildcard_count) =
+        items.iter().fold((0, 0), |(wc, qwc), item| match item {
+            SelectItem::Wildcard(_) => (wc + 1, qwc),
+            SelectItem::QualifiedWildcard(_, _) => (wc, qwc + 1),
+            _ => (wc, qwc),
+        });
+    if qualified_wildcard_count > 0 || wildcard_count > 1 {
+        return;
+    }
+
+    let wildcard_expansion = schema.fields().len().saturating_sub(items.len() - 1);
+
     let mut col_idx = 0;
     for item in items.iter_mut() {
         match item {
@@ -222,8 +237,11 @@ fn alias_select_items(items: &mut [SelectItem], schema: &DFSchemaRef) {
             SelectItem::ExprWithAlias { .. } => {
                 col_idx += 1;
             }
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                // Wildcards expand to multiple columns - skip position tracking
+            SelectItem::Wildcard(_) => {
+                col_idx += wildcard_expansion;
+            }
+            SelectItem::QualifiedWildcard(_, _) => {
+                unreachable!("qualified wildcards are handled above")
             }
         }
     }

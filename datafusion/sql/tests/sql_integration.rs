@@ -2679,6 +2679,25 @@ fn union_all_with_duplicate_expressions() {
 }
 
 #[test]
+fn union_with_qualified_and_duplicate_expressions() {
+    let sql = "\
+        SELECT 0 a, id b, price c, 0 d FROM test_decimal \
+        UNION SELECT 1, *, 1 FROM test_decimal";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @"
+    Distinct:
+      Union
+        Projection: Int64(0) AS a, test_decimal.id AS b, test_decimal.price AS c, Int64(0) AS d
+          TableScan: test_decimal
+        Projection: Int64(1) AS a, test_decimal.id, test_decimal.price, Int64(1) AS d
+          TableScan: test_decimal
+    "
+    );
+}
+
+#[test]
 fn intersect_with_duplicate_expressions() {
     let sql = "\
         SELECT 0 a, 0 b \
