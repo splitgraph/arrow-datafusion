@@ -62,7 +62,7 @@ impl InProgressSpillFile {
             ));
         }
         if self.writer.is_none() {
-            let schema = batch.schema();
+            let schema = self.spill_writer.schema();
             if let Some(ref in_progress_file) = self.in_progress_file {
                 self.writer = Some(IPCStreamWriter::new(
                     in_progress_file.path(),
