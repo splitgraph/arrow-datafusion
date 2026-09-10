@@ -20,11 +20,12 @@
 use std::{fmt::Display, hash::Hash, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, UInt64Array},
+    array::{Array, ArrayRef, UInt64Array},
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
 use datafusion_common::Result;
+use datafusion_common::ScalarValue;
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::{create_hashes, with_hashes};
 #[cfg(feature = "proto")]
@@ -271,6 +272,10 @@ impl HashExpr {
     }
 }
 
+/// A single-column dynamic-pruning literal set: the tested column and its non-null,
+/// deduplicated build-side values. Returned by [`HashTableLookupExpr::cached_pruning_scalars`].
+pub type PruningScalars = (Arc<dyn PhysicalExpr>, Arc<[ScalarValue]>);
+
 /// Physical expression that checks join keys in a [`Map`] (hash table or array map).
 ///
 /// Returns a [`BooleanArray`](arrow::array::BooleanArray) indicating if join keys (from `on_columns`) exist in the map.
@@ -284,6 +289,16 @@ pub struct HashTableLookupExpr {
     map: Arc<Map>,
     /// Description for display
     description: String,
+    /// Raw (undeduplicated) build-side values for dynamic pruning only (see
+    /// [`Self::cached_pruning_scalars`]) - `evaluate` always uses `map` instead. `None`
+    /// if the build side was too large or the join key is multi-column.
+    raw_pruning_values: Option<ArrayRef>,
+    /// Deduplicated and converted to non-null [`ScalarValue`]s lazily from
+    /// `raw_pruning_values` on first use, and cached here. `PruningPredicate` is rebuilt
+    /// independently for file, row-group, and page-index pruning, and again per
+    /// partition, so without this the conversion re-runs on every rebuild rather than
+    /// once per query - this dominated wall time for large build sides.
+    pruning_scalars_cache: std::sync::OnceLock<Option<Arc<[ScalarValue]>>>,
 }
 impl HashTableLookupExpr {
     /// Create a new HashTableLookupExpr
@@ -293,6 +308,7 @@ impl HashTableLookupExpr {
     /// * `random_state` - SeededRandomState for hashing
     /// * `map` - Map to check membership (hash table or array map)
     /// * `description` - Description for debugging
+    /// * `raw_pruning_values` - undeduplicated build-side values for pruning only, or `None`
     /// # Note
     /// This is public for internal testing purposes only and is not
     /// guaranteed to be stable across versions.
@@ -301,13 +317,48 @@ impl HashTableLookupExpr {
         random_state: SeededRandomState,
         map: Arc<Map>,
         description: String,
+        raw_pruning_values: Option<ArrayRef>,
     ) -> Self {
         Self {
             on_columns,
             random_state,
             map,
             description,
+            raw_pruning_values,
+            pruning_scalars_cache: std::sync::OnceLock::new(),
         }
+    }
+
+    /// If this lookup is on a single column, returns the tested column and its
+    /// deduplicated, non-null build-side values as [`ScalarValue`]s, so pruning code can
+    /// treat it like an IN-list. `None` for composite (multi-column) keys, since a
+    /// `LiteralGuarantee` only attributes literals to a single `Column`.
+    ///
+    /// Deduplicated and converted lazily from `raw_pruning_values` on first use and
+    /// cached, since `PruningPredicate` is rebuilt independently for file, row-group,
+    /// and page-index pruning, and again per partition - without caching, this O(n)
+    /// conversion re-runs on every rebuild rather than once per query.
+    pub fn cached_pruning_scalars(&self) -> Option<PruningScalars> {
+        if self.on_columns.len() != 1 {
+            return None;
+        }
+        let scalars = self
+            .pruning_scalars_cache
+            .get_or_init(|| {
+                let raw = self.raw_pruning_values.as_ref()?;
+                // Skip dedup if the build side is already unique (common star-schema
+                // case). `map`'s distinct count only covers non-null rows, so compare
+                // against the non-null row count.
+                let deduped =
+                    if self.map.num_of_distinct_key() == raw.len() - raw.null_count() {
+                        Arc::clone(raw)
+                    } else {
+                        super::inlist_builder::dedupe_array_values(raw)?
+                    };
+                ScalarValue::nonnull_scalars(deduped.as_ref()).map(Arc::from)
+            })
+            .as_ref()?;
+        Some((Arc::clone(&self.on_columns[0]), Arc::clone(scalars)))
     }
 }
 impl std::fmt::Debug for HashTableLookupExpr {
@@ -377,6 +428,7 @@ impl PhysicalExpr for HashTableLookupExpr {
             self.random_state.clone(),
             Arc::clone(&self.map),
             self.description.clone(),
+            self.raw_pruning_values.clone(),
         )))
     }
 
@@ -423,6 +475,8 @@ impl PhysicalExpr for HashTableLookupExpr {
             random_state: _,
             map: _,
             description: _,
+            raw_pruning_values: _,
+            pruning_scalars_cache: _,
         } = self;
 
         // HashTableLookupExpr holds a runtime Arc<Map> (the build-side hash
@@ -468,7 +522,7 @@ fn evaluate_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::joins::join_hash_map::JoinHashMapU32;
+    use crate::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32};
     use datafusion_physical_expr::expressions::Column;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
@@ -477,6 +531,135 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         value.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Builds a `JoinHashMapU32` containing exactly `distinct_hashes.len()` entries -
+    /// only the count matters for `num_of_distinct_key()`, not the hash content.
+    fn hash_map_with_distinct_count(distinct_hashes: &[u64]) -> Arc<Map> {
+        let mut map = JoinHashMapU32::with_capacity(distinct_hashes.len());
+        JoinHashMapType::update_from_iter(
+            &mut map,
+            Box::new(distinct_hashes.iter().enumerate()),
+            0,
+        );
+        Arc::new(Map::HashMap(Box::new(map)))
+    }
+
+    #[test]
+    fn test_cached_pruning_scalars_skips_dedup_when_already_distinct() {
+        let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        // 3 raw values, 3 distinct keys in the map: nothing for dedup to remove.
+        let hash_map = hash_map_with_distinct_count(&[100, 200, 300]);
+        let values: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+
+        let expr = HashTableLookupExpr::new(
+            vec![Arc::clone(&col_a)],
+            SeededRandomState::with_seed(1),
+            hash_map,
+            "hash_lookup".to_string(),
+            Some(values),
+        );
+
+        let (_, scalars) = expr
+            .cached_pruning_scalars()
+            .expect("should expose cached pruning scalars");
+        assert_eq!(
+            scalars.as_ref(),
+            [
+                ScalarValue::Int32(Some(1)),
+                ScalarValue::Int32(Some(2)),
+                ScalarValue::Int32(Some(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cached_pruning_scalars_dedups_when_duplicates_present() {
+        let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        // 4 raw values but only 3 distinct keys in the map: dedup has real work to do.
+        let hash_map = hash_map_with_distinct_count(&[100, 200, 300]);
+        let values: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 1, 3]));
+
+        let expr = HashTableLookupExpr::new(
+            vec![Arc::clone(&col_a)],
+            SeededRandomState::with_seed(1),
+            hash_map,
+            "hash_lookup".to_string(),
+            Some(values),
+        );
+
+        let (_, scalars) = expr
+            .cached_pruning_scalars()
+            .expect("should expose cached pruning scalars");
+        assert_eq!(scalars.len(), 3);
+    }
+
+    #[test]
+    fn test_cached_pruning_scalars_matches_and_is_cached() {
+        let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let hash_map = hash_map_with_distinct_count(&[100, 200, 300]);
+        let values: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+
+        let expr = HashTableLookupExpr::new(
+            vec![Arc::clone(&col_a)],
+            SeededRandomState::with_seed(1),
+            hash_map,
+            "hash_lookup".to_string(),
+            Some(values),
+        );
+
+        let (col, scalars) = expr
+            .cached_pruning_scalars()
+            .expect("should expose cached pruning scalars");
+        assert_eq!(col.to_string(), col_a.to_string());
+        assert_eq!(
+            scalars.as_ref(),
+            [
+                ScalarValue::Int32(Some(1)),
+                ScalarValue::Int32(Some(2)),
+                ScalarValue::Int32(Some(3)),
+            ]
+        );
+
+        // Second call hits the cache: same underlying allocation, not reconverted.
+        let (_, scalars_again) = expr.cached_pruning_scalars().unwrap();
+        assert!(Arc::ptr_eq(&scalars, &scalars_again));
+    }
+
+    #[test]
+    fn test_cached_pruning_scalars_absent_for_multi_column_keys() {
+        let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let col_b: PhysicalExprRef = Arc::new(Column::new("b", 1));
+        let hash_map =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
+        let values: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+
+        let expr = HashTableLookupExpr::new(
+            vec![col_a, col_b],
+            SeededRandomState::with_seed(1),
+            hash_map,
+            "hash_lookup".to_string(),
+            Some(values),
+        );
+
+        assert!(expr.cached_pruning_scalars().is_none());
+    }
+
+    #[test]
+    fn test_cached_pruning_scalars_absent_when_not_populated() {
+        let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let hash_map =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
+
+        let expr = HashTableLookupExpr::new(
+            vec![Arc::clone(&col_a)],
+            SeededRandomState::with_seed(1),
+            hash_map,
+            "hash_lookup".to_string(),
+            None,
+        );
+
+        assert!(expr.cached_pruning_scalars().is_none());
     }
 
     #[test]
@@ -757,6 +940,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup".to_string(),
+            None,
         );
 
         let expr2 = HashTableLookupExpr::new(
@@ -764,6 +948,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup".to_string(),
+            None,
         );
 
         assert_eq!(expr1, expr2);
@@ -782,6 +967,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup".to_string(),
+            None,
         );
 
         let expr2 = HashTableLookupExpr::new(
@@ -789,6 +975,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup".to_string(),
+            None,
         );
 
         assert_ne!(expr1, expr2);
@@ -805,6 +992,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup_one".to_string(),
+            None,
         );
 
         let expr2 = HashTableLookupExpr::new(
@@ -812,6 +1000,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup_two".to_string(),
+            None,
         );
 
         assert_ne!(expr1, expr2);
@@ -831,6 +1020,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             hash_map1,
             "lookup".to_string(),
+            None,
         );
 
         let expr2 = HashTableLookupExpr::new(
@@ -838,6 +1028,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             hash_map2,
             "lookup".to_string(),
+            None,
         );
 
         // Different Arc pointers means not equal (uses Arc::ptr_eq)
@@ -855,6 +1046,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup".to_string(),
+            None,
         );
 
         let expr2 = HashTableLookupExpr::new(
@@ -862,6 +1054,7 @@ mod tests {
             SeededRandomState::with_seed(1),
             Arc::clone(&hash_map),
             "lookup".to_string(),
+            None,
         );
 
         // Equal expressions should have equal hashes

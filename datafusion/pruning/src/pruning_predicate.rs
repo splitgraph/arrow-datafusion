@@ -52,6 +52,7 @@ use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
 use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
 use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
+use datafusion_physical_plan::joins::HashTableLookupExpr;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
@@ -558,7 +559,8 @@ impl<'a> PruningPredicateBuilder<'a> {
         // Simplify the newly created predicate to get rid of redundant casts, comparisons, etc.
         let predicate_expr =
             PhysicalExprSimplifier::new(&predicate_schema).simplify(predicate_expr)?;
-        let literal_guarantees = LiteralGuarantee::analyze(&predicate);
+        let mut literal_guarantees = LiteralGuarantee::analyze(&predicate);
+        literal_guarantees.extend(hash_lookup_literal_guarantees(&predicate));
 
         Ok(PruningPredicate {
             schema: file_schema,
@@ -570,6 +572,40 @@ impl<'a> PruningPredicateBuilder<'a> {
             can_be_inverted_for_full_match: !properties.has_filter_semantics_only,
         })
     }
+}
+
+/// Handles conjuncts that are a [`HashTableLookupExpr`] (a large join build side
+/// pushed down as an opaque hash-table lookup, not exposed via [`InListExpr`]).
+/// `LiteralGuarantee::analyze` can't see these itself: it lives in `physical-expr`,
+/// which `physical-plan` (where `HashTableLookupExpr` lives) depends on, not the
+/// reverse, so this must live here instead, alongside `physical-plan`.
+///
+/// [`InListExpr`]: datafusion_physical_expr::expressions::InListExpr
+#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // ScalarValue used as a hash key
+fn hash_lookup_literal_guarantees(
+    predicate: &Arc<dyn PhysicalExpr>,
+) -> Vec<LiteralGuarantee> {
+    let mut guarantees = Vec::new();
+    for conjunct in datafusion_physical_expr::split_conjunction(predicate) {
+        let Some(lookup) = conjunct.downcast_ref::<HashTableLookupExpr>() else {
+            continue;
+        };
+        let Some((col_expr, literals)) = lookup.cached_pruning_scalars() else {
+            continue;
+        };
+        let Some(column) = col_expr.downcast_ref::<phys_expr::Column>() else {
+            continue;
+        };
+        if literals.is_empty() {
+            continue;
+        }
+        guarantees.push(LiteralGuarantee {
+            column: Column::from_name(column.name()),
+            guarantee: Guarantee::In,
+            literals: literals.iter().cloned().collect(),
+        });
+    }
+    guarantees
 }
 
 /// Rewrites predicates that [`PredicateRewriter`] can not handle, e.g. certain
@@ -7339,5 +7375,60 @@ mod tests {
         let expected =
             "c1_null_count@2 != row_count@3 AND c1_min@0 <= a AND a <= c1_max@1";
         assert_eq!(res.to_string(), expected);
+    }
+
+    #[test]
+    fn test_hash_lookup_literal_guarantees() {
+        use datafusion_physical_plan::joins::join_hash_map::{
+            JoinHashMapType, JoinHashMapU32,
+        };
+        use datafusion_physical_plan::joins::{Map, SeededRandomState};
+
+        let mut hash_map = JoinHashMapU32::with_capacity(3);
+        let hashes = [100u64, 200, 300];
+        JoinHashMapType::update_from_iter(
+            &mut hash_map,
+            Box::new(hashes.iter().enumerate()),
+            0,
+        );
+        let map = Arc::new(Map::HashMap(Box::new(hash_map)));
+
+        let column: Arc<dyn PhysicalExpr> = Arc::new(phys_expr::Column::new("b", 0));
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+        let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
+            vec![Arc::clone(&column)],
+            SeededRandomState::with_seed(1),
+            map,
+            "hash_lookup".to_string(),
+            Some(values),
+        ));
+
+        let guarantees = hash_lookup_literal_guarantees(&lookup);
+        assert_eq!(guarantees.len(), 1);
+        assert_eq!(guarantees[0].column.name(), "b");
+        assert_eq!(guarantees[0].guarantee, Guarantee::In);
+        let mut lits: Vec<i32> = guarantees[0]
+            .literals
+            .iter()
+            .map(|s| match s {
+                ScalarValue::Int32(Some(v)) => *v,
+                other => panic!("unexpected literal: {other:?}"),
+            })
+            .collect();
+        lits.sort_unstable();
+        assert_eq!(lits, vec![10, 20, 30]);
+
+        // ANDed with a range predicate too, matching the real `bounds AND membership` shape.
+        let range_and_lookup: Arc<dyn PhysicalExpr> =
+            Arc::new(phys_expr::BinaryExpr::new(
+                Arc::new(phys_expr::BinaryExpr::new(
+                    Arc::clone(&column),
+                    Operator::GtEq,
+                    phys_expr::lit(10),
+                )),
+                Operator::And,
+                lookup,
+            ));
+        assert_eq!(hash_lookup_literal_guarantees(&range_and_lookup).len(), 1);
     }
 }

@@ -1835,6 +1835,21 @@ config_namespace! {
         /// See: <https://trino.io/docs/current/admin/dynamic-filtering.html#dynamic-filter-collection-thresholds>
         pub hash_join_inlist_pushdown_max_distinct_values: usize, default = 150
 
+        /// Maximum number of distinct build-side values to retain for row-group/file/bloom-filter
+        /// pruning once the build side is too large for `InList` pushdown and falls back to an
+        /// opaque hash-table-lookup filter. Set to 0 to disable.
+        ///
+        /// Defaults to 0: probing many build-side values against bloom filters costs real CPU that
+        /// usually outweighs the I/O saved, except on large row groups (e.g. remote storage) where
+        /// skipping one saves more than the probing costs. Raise this explicitly for that workload.
+        pub hash_join_dynamic_pruning_max_distinct_values: usize, default = 0
+
+        /// Companion size cap (bytes) for `hash_join_dynamic_pruning_max_distinct_values`,
+        /// mirroring `hash_join_inlist_pushdown_max_size`. The array checked against this is
+        /// the *raw*, undeduplicated build-side column, so this also protects against a build
+        /// side with few distinct values but many duplicate rows. Set to 0 to disable.
+        pub hash_join_dynamic_pruning_max_size: usize, default = 8 * 1024 * 1024
+
         /// The default filter selectivity used by Filter Statistics
         /// when an exact selectivity cannot be determined. Valid values are
         /// between 0 (no selectivity) and 100 (all rows are selected).
